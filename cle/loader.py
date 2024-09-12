@@ -18,6 +18,8 @@ from typing import (
 
 import archinfo
 from archinfo.arch_soot import ArchSoot
+from archinfo.arch_x86 import ArchX86 # TODO: added my mino
+from archinfo.arch_amd64 import ArchAMD64 # TODO: added my mino
 
 from cle import Symbol
 from cle.address_translator import AT
@@ -1100,7 +1102,9 @@ class Loader:
         """
         # this could be converted to being an iterator pretty easily
         for path in self._possible_paths(spec):
+            log.debug(f"_search_load_path: {path}, type: {type(path)}")
             if self._main_object is not None:
+                log.debug(f"main_object's arch: {self.main_object.arch}")
                 backend_cls = self._static_backend(path)
                 if backend_cls is None:
                     continue
@@ -1109,6 +1113,13 @@ class Loader:
                     # ... skip compatibility check, since it always evaluates to false
                     # with native libraries (which are the only valid dependencies)
                     return path
+                # If arch of main object is AMD64
+                if isinstance(self.main_object.arch, ArchAMD64):
+                    return path
+                # If arch of main object is X86
+                if isinstance(self.main_object.arch, ArchX86):
+                    return path
+                
                 if not backend_cls.check_compatibility(path, self.main_object):
                     continue
 
