@@ -241,6 +241,7 @@ class PE(Backend):
                     if reloc is not None:
                         self.imports[imp_name] = reloc
                         self.relocs.append(reloc)
+        # TODO: (mino) parse IAT for lazy binding.
 
     def _handle_exports(self):
         if hasattr(self._pe, "DIRECTORY_ENTRY_EXPORT"):
