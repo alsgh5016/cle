@@ -38,6 +38,9 @@ from .backends.tls import (
     TLSObject,
 )
 
+import capstone
+import pefile
+
 __all__ = ("Loader",)
 
 log = logging.getLogger(name=__name__)
@@ -848,7 +851,7 @@ class Loader:
             if isinstance(self.tls, ThreadManager):  # ... java
                 if isinstance(obj, MetaELF):
                     self._tls = ELFThreadManager(self, obj.arch)
-                elif isinstance(obj, PE):
+                elif isinstance(obj, PE): # TODO: check. by mino
                     self._tls = PEThreadManager(self, obj.arch)
 
         # STEP 1.5
@@ -941,6 +944,14 @@ class Loader:
 
             if obj.provides is not None:
                 self.shared_objects[obj.provides] = obj
+        
+        # TODO: Step 6 by mino.
+        # Modify the IMPORT ADDRESS TABLE for lazy binding
+        log.info(f"STEP 6: Resolving API addresses and updating IAT entries for the main binary...")
+        for obj in objects:
+            if obj.is_main_bin and isinstance(obj, PE):
+                log.debug(f"STEP 6.1: Processing object {obj}")
+                self._resolve_iat(obj, objects)
 
         return objects
 
@@ -1047,6 +1058,53 @@ class Loader:
             self.memory.add_backer(base_addr, obj.memory)
         obj._is_mapped = True
         key_bisect_insort_right(self.all_objects, obj, keyfunc=lambda x: x.min_addr)
+
+        # TODO: for debugging DLL load. by mino
+        try:
+            pe = pefile.PE(obj.binary)
+
+            for section in pe.sections:
+                section_name = section.Name.decode().rstrip('\x00')
+                if '.text' in section_name:
+                    text_section_start = section.VirtualAddress + base_addr
+                    text_section_size = section.Misc_VirtualSize
+                    log.info(f"Disassembling .text section at 0x{text_section_start:x}, size: {text_section_size}")
+
+                    # Extract the section's content
+                    memory_content = self.memory.load(text_section_start, text_section_size)
+
+                    # Initialize Capstone disassembler for x86 or x64 depending on architecture
+                    md = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_32 if obj.arch.bits == 32 else capstone.CS_MODE_64)
+
+                    # Disassemble the code
+                    for insn in md.disasm(memory_content, text_section_start):
+                        log.info(f"0x{insn.address:x}: {insn.mnemonic} {insn.op_str}")
+        except Exception as e:
+            log.error(f"Error during disassembly: {e}")
+
+        if obj.is_main_bin:
+            if hasattr(pe, 'DIRECTORY_ENTRY_IMPORT'):
+                log.info(f"Parsing IAT for {obj.binary} via DIRECTORY_ENTRY_IMPORT:")
+                for entry in pe.DIRECTORY_ENTRY_IMPORT:
+                    dll_name = entry.dll.decode('utf-8')
+                    log.info(f"Imported DLL: {dll_name}")
+                    
+                    # Iterate over the imports and fetch the thunk_address (IAT entries)
+                    for imp in entry.imports:
+                        if imp.import_by_ordinal:
+                            log.info(f"\tOrdinal Import at IAT entry: 0x{imp.address:x}, Ordinal: {imp.ordinal}")
+                        else:
+                            log.info(f"\tFunction: {imp.name.decode('utf-8')} at IAT entry: 0x{imp.address:x}")
+
+                        # Now debug the memory content at imp.address (IAT entry)
+                        try:
+                            # Read 8 bytes from the IAT entry address
+                            memory_value = self.memory.load(imp.address, 4)
+                            log.info(f"\tIAT content at 0x{imp.address:x}: {memory_value[::-1].hex()}")
+                        except Exception as e:
+                            log.error(f"\tError reading memory at IAT entry 0x{imp.address:x}: {e}")
+            else:
+                log.info(f"No IAT found for {obj.binary} using DIRECTORY_ENTRY_IMPORT")
 
     # Address space management
 
@@ -1334,3 +1392,62 @@ class Loader:
             return self.memory.unpack_word(addr, size=size)
         except KeyError:
             return None
+
+    def _resolve_iat(self, main_obj, loaded_objects):
+        """
+        Resolves the IAT entries of the main binary by using the already loaded DLLs.
+        """
+        try:
+            log.debug(f"Successfully called _resolve_iat!")
+            pe = pefile.PE(main_obj.binary)
+            
+            if hasattr(pe, 'DIRECTORY_ENTRY_IMPORT'):
+                log.info(f"Resolving IAT for {main_obj.binary} via DIRECTORY_ENTRY_IMPORT:")
+                for entry in pe.DIRECTORY_ENTRY_IMPORT:
+                    dll_name = entry.dll.decode('utf-8')
+                    log.info(f"Imported DLL: {dll_name}")
+
+                    # Find the loaded object corresponding to this DLL
+                    dll_obj = self._find_loaded_object(dll_name, loaded_objects)
+                    if dll_obj is None:
+                        log.error(f"Error {dll_name} not found in the loaded objects.")
+                        continue
+
+                    for imp in entry.imports:
+                        if imp.import_by_ordinal:
+                            log.info(f"\tOridinal Import at IAT entry: 0x{imp.address}")
+                        else:
+                            func_name = imp.name.decode('utf-8')
+                            log.info(f"\tResolving Function: {func_name} at IAT entry: 0x{imp.address:x}")
+
+                            resolved_addr = self._resolve_function_from_loaded_dll(dll_obj, func_name)
+                            if resolved_addr:
+                                log.info(f"\tWriting resolved address 0x{resolved_addr:x} to IAT entry 0x{imp.address:x}")
+                                self.memory.store(imp.address, resolved_addr.to_bytes(4, byteorder='little'))
+                            else:
+                                log.warning(f"Function {func_name} not found in {dll_name}'s export table.")
+            else:
+                log.info(f"No IAT found for {main_obj.binary} using DIRECTORY_ENTRY_IMPORT")
+        except Exception as e:
+            log.error(f"Error during IAT resolution for {main_obj.binary}: {e}")
+    
+    def _find_loaded_object(self, dll_name, loaded_objects):
+        """
+        Finds the loaded object corresponding to the given DLL name.
+        """
+        for obj in loaded_objects:
+            if obj.provides and obj.provides.lower() == dll_name.lower():
+                return obj
+        return None
+    
+
+    def _resolve_function_from_loaded_dll(self, dll_obj, function_name):
+        """
+        Resolves the function address from the export table of the loaded DLL object.
+        """
+        log.debug(f"Func Name: {function_name}")
+        if hasattr(dll_obj, 'symbols'):
+            for sym in dll_obj.symbols:
+                if sym.name and sym.name == function_name:
+                    return sym.rebased_addr
+        return None
