@@ -948,10 +948,10 @@ class Loader:
         # TODO: Step 6 by mino.
         # Modify the IMPORT ADDRESS TABLE for lazy binding
         log.info(f"STEP 6: Resolving API addresses and updating IAT entries for the main binary...")
-        for obj in objects:
+        for obj in ordered_objects: ## TODO: (done by mino) fix objects to ordered_objects
             if obj.is_main_bin and isinstance(obj, PE):
                 log.debug(f"STEP 6.1: Processing object {obj}")
-                self._resolve_iat(obj, objects)
+                self._resolve_iat(obj, ordered_objects)
 
         return objects
 
@@ -1062,23 +1062,6 @@ class Loader:
         # TODO: for debugging DLL load. by mino
         try:
             pe = pefile.PE(obj.binary)
-
-            for section in pe.sections:
-                section_name = section.Name.decode().rstrip('\x00')
-                if '.text' in section_name:
-                    text_section_start = section.VirtualAddress + base_addr
-                    text_section_size = section.Misc_VirtualSize
-                    log.info(f"Disassembling .text section at 0x{text_section_start:x}, size: {text_section_size}")
-
-                    # Extract the section's content
-                    memory_content = self.memory.load(text_section_start, text_section_size)
-
-                    # Initialize Capstone disassembler for x86 or x64 depending on architecture
-                    md = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_32 if obj.arch.bits == 32 else capstone.CS_MODE_64)
-
-                    # Disassemble the code
-                    for insn in md.disasm(memory_content, text_section_start):
-                        log.info(f"0x{insn.address:x}: {insn.mnemonic} {insn.op_str}")
         except Exception as e:
             log.error(f"Error during disassembly: {e}")
 
@@ -1100,7 +1083,7 @@ class Loader:
                         try:
                             # Read 8 bytes from the IAT entry address
                             memory_value = self.memory.load(imp.address, 4)
-                            log.info(f"\tIAT content at 0x{imp.address:x}: {memory_value[::-1].hex()}")
+                            log.debug(f"\tIAT content at 0x{imp.address:x}: {memory_value[::-1].hex()}")
                         except Exception as e:
                             log.error(f"\tError reading memory at IAT entry 0x{imp.address:x}: {e}")
             else:
@@ -1398,7 +1381,6 @@ class Loader:
         Resolves the IAT entries of the main binary by using the already loaded DLLs.
         """
         try:
-            log.debug(f"Successfully called _resolve_iat!")
             pe = pefile.PE(main_obj.binary)
             
             if hasattr(pe, 'DIRECTORY_ENTRY_IMPORT'):
@@ -1425,7 +1407,7 @@ class Loader:
                                 log.info(f"\tWriting resolved address 0x{resolved_addr:x} to IAT entry 0x{imp.address:x}")
                                 self.memory.store(imp.address, resolved_addr.to_bytes(4, byteorder='little'))
                             else:
-                                log.warning(f"Function {func_name} not found in {dll_name}'s export table.")
+                                log.warning(f"\tFunction {func_name} not found in {dll_name}'s export table.")
             else:
                 log.info(f"No IAT found for {main_obj.binary} using DIRECTORY_ENTRY_IMPORT")
         except Exception as e:
@@ -1445,9 +1427,19 @@ class Loader:
         """
         Resolves the function address from the export table of the loaded DLL object.
         """
-        log.debug(f"Func Name: {function_name}")
-        if hasattr(dll_obj, 'symbols'):
-            for sym in dll_obj.symbols:
-                if sym.name and sym.name == function_name:
-                    return sym.rebased_addr
-        return None
+
+        if not hasattr(dll_obj, 'symbols') or not dll_obj.symbols:
+            log.error(f"No symbols found for DLL {dll_obj.provides}")
+            return None
+        
+        if function_name in dll_obj._exports:
+            sym = dll_obj._exports[function_name]
+            if sym.is_forward is True:
+                resolved_addr = sym.resolvedby.rebased_addr
+                
+                log.debug(f"Resolved function {function_name} at address: 0x{resolved_addr:x} from: {sym.resolvedby.owner} | {sym.resolvedby.name}")
+                return resolved_addr
+            
+            resolved_addr = sym.rebased_addr
+            log.debug(f"Resolved function {function_name} at address: 0x{resolved_addr:x} in DLL: {dll_obj.provides}")
+            return resolved_addr

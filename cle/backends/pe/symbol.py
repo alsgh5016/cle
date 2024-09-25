@@ -34,7 +34,9 @@ class WinSymbol(Symbol):
                 return None
             seen.add(sym.forwarder)
             owner_name, name = sym.forwarder.split(".", 1)
-            owner = self.owner.loader.find_object(owner_name)
+            owner_name = owner_name.lower() + ".dll"
+            # TODO: (done by mino) replace the find_object function to another find_XX function.
+            owner = self.owner.loader.find_object(owner_name, self.owner.loader.preload_libs)
             if owner is None:
                 return None
             sym = owner.get_symbol(name)
